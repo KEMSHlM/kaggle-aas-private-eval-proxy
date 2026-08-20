@@ -26,6 +26,7 @@ from pathlib import Path
 
 from private_eval_proxy import _sdk  # noqa: F401  (side effects: sys.path + env)
 from private_eval_proxy import aggregate
+from private_eval_proxy import scenarios
 from private_eval_proxy.backends import default_concurrency, make_agent_factory
 from private_eval_proxy.cost import CostAccountingSink
 from private_eval_proxy.private_guard import (
@@ -62,11 +63,14 @@ def replay_one(rec: dict, target: str, *, guard_kind: str, max_hops: int,
     own guard + cost sink, so it is independent and thread-safe.
     """
     candidate = AttackCandidate(user_messages=tuple(rec["user_messages"]))
-    fixtures = resolve_fixtures_dir()
+    # The private variants (private_a/private_b) share the stand-in guardrail; they differ only in
+    # the fixtures (see scenarios.py — private_b rewrites the fixture values). public uses the SDK's
+    # own fixtures unchanged.
+    fixtures = scenarios.fixtures_for(guard_kind, resolve_fixtures_dir())
     sink = CostAccountingSink()
     started = time.perf_counter()
 
-    if guard_kind == "private":
+    if scenarios.is_private(guard_kind):
         # The judge shares the agent-under-test's wiring: same backend + target model.
         guard = PrivateGuardrail(debug_sink=sink, judge_backend=backend, judge_target=target)
 
@@ -78,7 +82,9 @@ def replay_one(rec: dict, target: str, *, guard_kind: str, max_hops: int,
         guard = OptimalGuardrail()
         hook_factory = HookRegistry
     else:
-        raise ValueError(f"guard_kind must be 'private' or 'public', got {guard_kind!r}")
+        raise ValueError(
+            f"guard_kind must be one of {scenarios.KNOWN_KINDS}, got {guard_kind!r}"
+        )
 
     trace = _replay_candidate_trace(
         candidate=candidate,
@@ -94,7 +100,7 @@ def replay_one(rec: dict, target: str, *, guard_kind: str, max_hops: int,
     wall_latency = time.perf_counter() - started
 
     predicates = (
-        eval_predicates_realistic(trace) if guard_kind == "private" else eval_predicates(trace)
+        eval_predicates_realistic(trace) if scenarios.is_private(guard_kind) else eval_predicates(trace)
     )
     finding = None
     if predicates:
@@ -118,7 +124,7 @@ def replay_one(rec: dict, target: str, *, guard_kind: str, max_hops: int,
     cost["candidate_raw"] = score_attack_raw([finding]) if finding else 0.0
     # The private guard records each judge verdict (tool, ALLOW/DENY, rationale); carry it out so the
     # CLI artifact can show *why* the judge allowed/denied. Public guard has no judge.
-    if guard_kind == "private":
+    if scenarios.is_private(guard_kind):
         cost["judge_decisions"] = list(guard.judge_log)
     return trace, predicates, finding, cost
 
@@ -291,8 +297,12 @@ def main(argv=None) -> int:
     parser.add_argument("--targets", default="gpt_oss,gemma", help="comma-separated short names")
     parser.add_argument("--backend", default="openrouter",
                         choices=["openrouter", "kaggle_gguf", "deterministic"])
-    parser.add_argument("--env", required=True, choices=["public", "private"],
-                        help="which guard regime to replay against (no default — pick one)")
+    parser.add_argument("--env", required=True,
+                        choices=["public", "private", "private_a", "private_b"],
+                        help="which environment to replay against (no default — pick one). "
+                             "private_a and private_b share the private guardrail and differ only "
+                             "in the fixture values: private_a reuses the public values, private_b "
+                             "rewrites them (see scenarios.py). private is an alias of private_a.")
     parser.add_argument("--reps", type=int, default=3, help="replays per candidate")
     parser.add_argument("--concurrency", type=int, default=32, help="parallel replays (network backends)")
     parser.add_argument("--max-hops", type=int, default=EVALUATION_DEFAULT_MAX_TOOL_HOPS)
