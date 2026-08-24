@@ -24,12 +24,15 @@ def test_private_and_private_a_pass_through_unchanged():
     base = _base()
     assert scenarios.fixtures_for("private", base) == base
     assert scenarios.fixtures_for("private_a", base) == base
+    # private_c is a guard-axis variant: it reuses the base fixtures unchanged.
+    assert scenarios.fixtures_for("private_c", base) == base
 
 
 def test_is_private_classification():
     assert scenarios.is_private("private")
     assert scenarios.is_private("private_a")
     assert scenarios.is_private("private_b")
+    assert scenarios.is_private("private_c")
     assert not scenarios.is_private("public")
 
 

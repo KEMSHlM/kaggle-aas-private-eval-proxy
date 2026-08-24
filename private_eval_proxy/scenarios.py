@@ -11,8 +11,10 @@ email addresses, the secret in ``secret.txt`` — are **reused** in that held-ou
 * if the values are not reused, only what the candidate discovers at replay (by listing the inbox,
   searching the web corpus, reading the file) can transfer.
 
-Both are plausible, so we replay under both and submit for each. This module supplies the fixtures
-for each variant. The guardrail is unchanged across the two — only the fixture values differ.
+Both are plausible, so we replay under both and submit for each. This module owns **fixture
+selection only**: ``private_a``/``private_b`` vary the fixtures (the guardrail is unchanged between
+them), while ``private_c`` instead varies the guardrail's *taint profile* and reuses the base
+fixtures — that guard switch lives in ``runner.py`` / ``taint.py``, not here.
 
 Variants
 --------
@@ -24,6 +26,11 @@ Variants
     text are left intact, so the structural handles a candidate discovers at replay still work; only
     the literal values a candidate might have copied from the public fixtures stop matching. Models
     "the values are not reused".
+``private_c``
+    The base fixtures (same as ``private_a``), but the *guardrail* — not the fixtures — is varied: it
+    swaps the legacy whole-envelope taint input for a body-aware relaxed taint profile (see the
+    proxy's ``taint.py``). ``private_a``/``private_b`` are a **fixture** axis; ``private_c`` is a
+    **guard** axis. Fixture selection here just returns the base fixtures.
 
 The rewrite is deterministic (a pure function of each original value), so a ``private_b`` replay is
 reproducible and equal values map to equal replacements across files. Because the guardrail and the
@@ -46,7 +53,7 @@ import threading
 from pathlib import Path
 
 # Guard kinds that use the private stand-in guardrail (as opposed to the public OptimalGuardrail).
-PRIVATE_KINDS = ("private", "private_a", "private_b")
+PRIVATE_KINDS = ("private", "private_a", "private_b", "private_c")
 
 # Guard kinds this module accepts, in addition to "public".
 KNOWN_KINDS = PRIVATE_KINDS + ("public",)
@@ -136,8 +143,9 @@ def _build_private_b(base: Path) -> Path:
 def fixtures_for(guard_kind: str, base_fixtures: Path) -> Path:
     """Return the fixtures directory for ``guard_kind``.
 
-    ``private`` / ``private_a`` / ``public`` use ``base_fixtures`` unchanged; ``private_b`` uses a
-    value-rewritten copy of it.
+    ``private`` / ``private_a`` / ``private_c`` / ``public`` use ``base_fixtures`` unchanged;
+    ``private_b`` uses a value-rewritten copy of it. (``private_c`` varies the guardrail's taint
+    profile, not the fixtures — see runner.py / taint.py.)
     """
     if guard_kind == "private_b":
         return _build_private_b(Path(base_fixtures))

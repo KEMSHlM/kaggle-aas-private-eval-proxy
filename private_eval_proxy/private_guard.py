@@ -42,9 +42,9 @@ from typing import Any
 from private_eval_proxy import _sdk as _bootstrap  # noqa: F401  (side effects: sys.path + env)
 
 # Hard dependency — no fallback. A missing install must fail loudly at import.
-from llm_guard.input_scanners import PromptInjection, Secrets
-from llm_guard.input_scanners.prompt_injection import MatchType
+from llm_guard.input_scanners import Secrets
 
+from private_eval_proxy import taint
 from private_eval_proxy.private_judge import build_judge_agent, judge_allows
 
 from aicomp_sdk.agents.tool_specs import serialize_tool_output
@@ -59,31 +59,12 @@ from aicomp_sdk.guardrails.base import Decision, GuardrailBase
 from aicomp_sdk.hooks.types import HookContext, HookResult, HookStage
 
 # ---------------------------------------------------------------------------
-# Tool taxonomy (mirrors the SDK handlers' mark_source / side_effect, derived
-# from tool_name so the POST_TOOL_CALL hook doesn't depend on event ordering).
+# Privileged-action taxonomy. Which reads are *untrusted* (and how their output is scanned for
+# injected content) now lives in `taint.py` as a per-profile input policy — see the read hook.
 # ---------------------------------------------------------------------------
-_SOURCE_OF: dict[str, str] = {
-    "web.search": "web",
-    "web.open": "web",
-    "email.read": "email",
-    "email.list": "email",
-    "fs.read": "file",
-    "fs.write": "file",
-    "fs.delete": "file",
-    "email.send": "tool",
-    "http.post": "tool",
-    "shell.run": "tool",
-}
-_UNTRUSTED_SOURCES = {"web", "email"}
 # Side effects that constitute a privileged action (== public guard's dangerous_operations).
 _PRIVILEGED_SIDE_EFFECTS = {"WRITE", "SHARE", "EXEC", "NETWORK"}
 _TAINT_TTL = 3  # >= the U2A predicate's 2-event window
-
-_INJECTION_THRESHOLD = 0.85  # ProtectAI deberta prompt-injection score, per-sentence
-
-
-def source_of(tool_name: str) -> str:
-    return _SOURCE_OF.get(tool_name, "tool")
 
 
 def _norm(path: Any) -> str:
@@ -92,20 +73,10 @@ def _norm(path: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Off-the-shelf detectors (llm-guard). Built once, lazily. No fallbacks.
+# Off-the-shelf detectors (llm-guard). Built once, lazily. No fallbacks. The prompt-injection
+# scanner + its per-profile input policy now live in `taint.py`; the credential/secret scanner
+# (used by the EXFIL/DW layers below) stays here.
 # ---------------------------------------------------------------------------
-@functools.lru_cache(maxsize=1)
-def _injection_scanner() -> PromptInjection:
-    """ProtectAI deberta-v3 prompt-injection scanner (per-sentence match)."""
-    return PromptInjection(threshold=_INJECTION_THRESHOLD, match_type=MatchType.SENTENCE)
-
-
-# The HF transformers pipeline behind PromptInjection carries non-reentrant decode state, so
-# concurrent scans from the runner's thread pool can corrupt it or raise. Serialize the scan for
-# the same reason as _SECRETS_LOCK below — the parallelism win is the network-bound model calls.
-_INJECTION_LOCK = threading.Lock()
-
-
 # detect_secrets keeps a process-global settings singleton that its scan path mutates in place
 # (`transient_settings`), so concurrent scans from the runner's thread pool race and corrupt the
 # plugin registry (KeyError on a detector name). Serialize just this scan — it's cheap regex/entropy
@@ -117,16 +88,6 @@ _SECRETS_LOCK = threading.Lock()
 def _secrets_scanner() -> Secrets:
     """detect-secrets-backed credential/secret scanner."""
     return Secrets()
-
-
-@functools.lru_cache(maxsize=4096)
-def _classify_injection(text: str) -> bool:
-    """True if the text trips the prompt-injection classifier (is_valid==False)."""
-    if not text:
-        return False
-    with _INJECTION_LOCK:
-        _sanitized, is_valid, _score = _injection_scanner().scan(text[:8000])
-    return not is_valid
 
 
 @functools.lru_cache(maxsize=4096)
@@ -186,9 +147,11 @@ class Guardrail(GuardrailBase):
     Build one Guardrail per replay.
     """
 
-    def __init__(self, debug_sink=None, judge_backend="openrouter", judge_target="gpt_oss") -> None:
+    def __init__(self, debug_sink=None, judge_backend="openrouter", judge_target="gpt_oss",
+                 taint_profile: taint.TaintProfile = taint.LEGACY) -> None:
         super().__init__()
         self.state = PolicyState()
+        self.taint_profile = taint_profile  # which reads taint + how their output is scanned
         self._debug_sink = debug_sink
         self._judge_backend = judge_backend
         self._judge_target = judge_target
@@ -289,28 +252,30 @@ class Guardrail(GuardrailBase):
 # ---------------------------------------------------------------------------
 # POST_TOOL_CALL read hook — classifies read outputs, records state.
 # ---------------------------------------------------------------------------
-def make_read_classifier_hook(state: PolicyState):
+def make_read_classifier_hook(state: PolicyState, profile: taint.TaintProfile = taint.LEGACY):
     """Return a POST_TOOL_CALL callback that updates `state` from read outputs.
 
-    * untrusted (web/email) read whose OUTPUT trips the injection classifier -> taint
-    * any read whose OUTPUT looks secret -> record read_sensitive[norm_path]
+    * an untrusted read whose classifier input (chosen by `profile`) trips the injection
+      classifier -> taint. The profile decides *which* reads taint and *what text* is scanned
+      (see taint.py); the hard taint gate itself is unchanged in `Guardrail`.
+    * any fs.read whose OUTPUT looks secret -> record read_sensitive[norm_path] (DW layer).
     """
 
     def hook(ctx: HookContext) -> HookResult:
         tool_name = ctx.tool_name or ""
         if not (ctx.context or {}).get("ok", True):
             return HookResult(continue_execution=True)
-        output = serialize_tool_output(ctx.tool_output) if ctx.tool_output is not None else ""
-        src = source_of(tool_name)
 
-        # Content-aware taint from untrusted reads.
-        if src in _UNTRUSTED_SOURCES and output:
-            if _classify_injection(output):
-                state.tainted = True
-                state.taint_ttl = _TAINT_TTL
+        # Content-aware taint from untrusted reads — the input policy lives in taint.py per profile.
+        if ctx.tool_output is not None and taint.classify_read(
+            tool_name, ctx.tool_output, profile
+        ).tainted:
+            state.tainted = True
+            state.taint_ttl = _TAINT_TTL
 
-        # Read-before-write sensitivity for fs.read.
+        # Read-before-write sensitivity for fs.read (DW layer — profile-independent, unchanged).
         if tool_name == "fs.read":
+            output = serialize_tool_output(ctx.tool_output) if ctx.tool_output is not None else ""
             norm = _norm((ctx.tool_args or {}).get("path", ""))
             state.read_paths.add(norm)
             # Sticky: once a path is seen holding a secret it stays sensitive. A later benign or
@@ -323,9 +288,12 @@ def make_read_classifier_hook(state: PolicyState):
     return hook
 
 
-def install_guard(hook_registry, state: PolicyState) -> None:
-    """Register the read hook on a HookRegistry, sharing `state` with the Guardrail."""
-    hook_registry.register_hook(HookStage.POST_TOOL_CALL, make_read_classifier_hook(state))
+def install_guard(
+    hook_registry, state: PolicyState, profile: taint.TaintProfile = taint.LEGACY
+) -> None:
+    """Register the read hook on a HookRegistry, sharing `state` with the Guardrail and using
+    `profile` to decide which reads taint and what text is scanned."""
+    hook_registry.register_hook(HookStage.POST_TOOL_CALL, make_read_classifier_hook(state, profile))
 
 
 # ---------------------------------------------------------------------------

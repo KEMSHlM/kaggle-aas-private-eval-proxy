@@ -27,6 +27,7 @@ from pathlib import Path
 from private_eval_proxy import _sdk  # noqa: F401  (side effects: sys.path + env)
 from private_eval_proxy import aggregate
 from private_eval_proxy import scenarios
+from private_eval_proxy import taint
 from private_eval_proxy.backends import default_concurrency, make_agent_factory
 from private_eval_proxy.cost import CostAccountingSink
 from private_eval_proxy.private_guard import (
@@ -63,20 +64,26 @@ def replay_one(rec: dict, target: str, *, guard_kind: str, max_hops: int,
     own guard + cost sink, so it is independent and thread-safe.
     """
     candidate = AttackCandidate(user_messages=tuple(rec["user_messages"]))
-    # The private variants (private_a/private_b) share the stand-in guardrail; they differ only in
-    # the fixtures (see scenarios.py — private_b rewrites the fixture values). public uses the SDK's
-    # own fixtures unchanged.
+    # The private variants share the stand-in guardrail. private_a/private_b differ only in the
+    # fixtures (scenarios.py — private_b rewrites the values); private_c instead keeps the base
+    # fixtures but swaps in the body-aware relaxed taint profile (taint.py). public uses the SDK's
+    # own fixtures + guardrail unchanged.
     fixtures = scenarios.fixtures_for(guard_kind, resolve_fixtures_dir())
     sink = CostAccountingSink()
     started = time.perf_counter()
 
     if scenarios.is_private(guard_kind):
-        # The judge shares the agent-under-test's wiring: same backend + target model.
-        guard = PrivateGuardrail(debug_sink=sink, judge_backend=backend, judge_target=target)
+        # The judge shares the agent-under-test's wiring: same backend + target model. The taint
+        # profile is the only env->guard difference among the private variants: private/_a/_b use
+        # the legacy (whole-envelope) taint input; private_c uses the body-aware relaxed input.
+        profile = taint.profile_for(guard_kind)
+        guard = PrivateGuardrail(
+            debug_sink=sink, judge_backend=backend, judge_target=target, taint_profile=profile
+        )
 
-        def hook_factory(_state=guard.state):
+        def hook_factory(_state=guard.state, _profile=profile):
             reg = HookRegistry()
-            install_guard(reg, _state)
+            install_guard(reg, _state, _profile)
             return reg
     elif guard_kind == "public":
         guard = OptimalGuardrail()
@@ -298,11 +305,13 @@ def main(argv=None) -> int:
     parser.add_argument("--backend", default="openrouter",
                         choices=["openrouter", "kaggle_gguf", "deterministic"])
     parser.add_argument("--env", required=True,
-                        choices=["public", "private", "private_a", "private_b"],
+                        choices=["public", "private", "private_a", "private_b", "private_c"],
                         help="which environment to replay against (no default — pick one). "
                              "private_a and private_b share the private guardrail and differ only "
                              "in the fixture values: private_a reuses the public values, private_b "
-                             "rewrites them (see scenarios.py). private is an alias of private_a.")
+                             "rewrites them (see scenarios.py). private is an alias of private_a. "
+                             "private_c uses the base fixtures with a body-aware relaxed taint "
+                             "guard (see taint.py).")
     parser.add_argument("--reps", type=int, default=3, help="replays per candidate")
     parser.add_argument("--concurrency", type=int, default=32, help="parallel replays (network backends)")
     parser.add_argument("--max-hops", type=int, default=EVALUATION_DEFAULT_MAX_TOOL_HOPS)
