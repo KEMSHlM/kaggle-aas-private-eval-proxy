@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +27,7 @@ from pathlib import Path
 
 from private_eval_proxy import _sdk  # noqa: F401  (side effects: sys.path + env)
 from private_eval_proxy import aggregate
+from private_eval_proxy import taint
 from private_eval_proxy.backends import default_concurrency, make_agent_factory
 from private_eval_proxy.cost import CostAccountingSink
 from private_eval_proxy.private_guard import (
@@ -33,6 +35,7 @@ from private_eval_proxy.private_guard import (
     eval_predicates_realistic,
     install_guard,
 )
+from private_eval_proxy.private_judge import JudgeProfile, judge_profile_for
 
 from aicomp_sdk.attacks import AttackCandidate
 from aicomp_sdk.core.cells import cell_signature
@@ -48,6 +51,8 @@ from aicomp_sdk.hooks.registry import HookRegistry
 from aicomp_sdk.scoring import score_attack_raw
 
 ENV_SEED = 123  # matches the judge default (ops.py attack_env_seed=123)
+PRIVATE_KINDS = ("private", "private_a", "private_b", "private_c")
+KNOWN_KINDS = ("public", *PRIVATE_KINDS)
 
 
 # --------------------------------------------------------------------------- replay (the contract)
@@ -62,23 +67,36 @@ def replay_one(rec: dict, target: str, *, guard_kind: str, max_hops: int,
     own guard + cost sink, so it is independent and thread-safe.
     """
     candidate = AttackCandidate(user_messages=tuple(rec["user_messages"]))
+    # Every guard profile uses the same unchanged SDK fixtures. Private profiles share the
+    # content-only taint policy; private_c varies only the content-aware U2A judge/evidence path.
+    # Public uses the SDK guardrail unchanged.
     fixtures = resolve_fixtures_dir()
     sink = CostAccountingSink()
     started = time.perf_counter()
 
-    if guard_kind == "private":
-        # The judge shares the agent-under-test's wiring: same backend + target model.
-        guard = PrivateGuardrail(debug_sink=sink, judge_backend=backend, judge_target=target)
+    if guard_kind in PRIVATE_KINDS:
+        # The judge shares the agent-under-test's wiring: same backend + target model. Taint input
+        # is content-only for every private profile; private_c alone shows the judge actual
+        # untrusted content for U2A and records bounded read evidence.
+        taint_profile = taint.profile_for(guard_kind)
+        judge_profile = judge_profile_for(guard_kind)
+        record_evidence = judge_profile is JudgeProfile.PRIVATE_C
+        guard = PrivateGuardrail(
+            debug_sink=sink, judge_backend=backend, judge_target=target,
+            taint_profile=taint_profile, judge_profile=judge_profile,
+        )
 
-        def hook_factory(_state=guard.state):
+        def hook_factory(_state=guard.state, _profile=taint_profile, _rec=record_evidence):
             reg = HookRegistry()
-            install_guard(reg, _state)
+            install_guard(reg, _state, _profile, record_evidence=_rec)
             return reg
     elif guard_kind == "public":
         guard = OptimalGuardrail()
         hook_factory = HookRegistry
     else:
-        raise ValueError(f"guard_kind must be 'private' or 'public', got {guard_kind!r}")
+        raise ValueError(
+            f"guard_kind must be one of {KNOWN_KINDS}, got {guard_kind!r}"
+        )
 
     trace = _replay_candidate_trace(
         candidate=candidate,
@@ -94,7 +112,7 @@ def replay_one(rec: dict, target: str, *, guard_kind: str, max_hops: int,
     wall_latency = time.perf_counter() - started
 
     predicates = (
-        eval_predicates_realistic(trace) if guard_kind == "private" else eval_predicates(trace)
+        eval_predicates_realistic(trace) if guard_kind in PRIVATE_KINDS else eval_predicates(trace)
     )
     finding = None
     if predicates:
@@ -118,8 +136,11 @@ def replay_one(rec: dict, target: str, *, guard_kind: str, max_hops: int,
     cost["candidate_raw"] = score_attack_raw([finding]) if finding else 0.0
     # The private guard records each judge verdict (tool, ALLOW/DENY, rationale); carry it out so the
     # CLI artifact can show *why* the judge allowed/denied. Public guard has no judge.
-    if guard_kind == "private":
+    if guard_kind in PRIVATE_KINDS:
         cost["judge_decisions"] = list(guard.judge_log)
+        cost["judge_profile"] = guard.judge_profile.value
+        cost["judge_backend"] = os.environ.get("PRIVATE_GUARD_JUDGE_BACKEND", "").strip().lower() or backend
+        cost["judge_target"] = os.environ.get("PRIVATE_GUARD_JUDGE_TARGET", "").strip() or target
     return trace, predicates, finding, cost
 
 
@@ -291,8 +312,12 @@ def main(argv=None) -> int:
     parser.add_argument("--targets", default="gpt_oss,gemma", help="comma-separated short names")
     parser.add_argument("--backend", default="openrouter",
                         choices=["openrouter", "kaggle_gguf", "deterministic"])
-    parser.add_argument("--env", required=True, choices=["public", "private"],
-                        help="which guard regime to replay against (no default — pick one)")
+    parser.add_argument("--env", required=True,
+                        choices=["public", "private", "private_a", "private_b", "private_c"],
+                        help="which environment to replay against (no default — pick one). "
+                             "All profiles use the same SDK fixtures; all private profiles use "
+                             "content-only taint. private_c additionally enables the content-aware "
+                             "U2A judge/evidence path.")
     parser.add_argument("--reps", type=int, default=3, help="replays per candidate")
     parser.add_argument("--concurrency", type=int, default=32, help="parallel replays (network backends)")
     parser.add_argument("--max-hops", type=int, default=EVALUATION_DEFAULT_MAX_TOOL_HOPS)
